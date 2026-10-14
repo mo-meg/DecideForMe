@@ -89,9 +89,9 @@ export default function App() {
     return (localStorage.getItem('decision_backend_provider') as 'firebase' | 'ollama') || 'firebase';
   });
 
-  // Ollama Local Configuration
+  // Ollama Local Configuration (defaults to Vite proxy /ollama-proxy to avoid HTTPS mixed content)
   const [ollamaEndpoint, setOllamaEndpoint] = useState<string>(() => {
-    return localStorage.getItem('ollama_endpoint') || 'http://localhost:11434';
+    return localStorage.getItem('ollama_endpoint') || '/ollama-proxy';
   });
   const [ollamaModel, setOllamaModel] = useState<string>(() => {
     return localStorage.getItem('ollama_model') || 'llama3.2';
