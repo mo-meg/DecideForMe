@@ -1,0 +1,23 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile containing decision priorities",
+      "type": "object",
+      "properties": {
+        "priorities": {
+          "type": "string",
+          "maxLength": 5000,
+          "description": "User life priorities and evaluation weights"
+        }
+      },
+      "required": ["priorities"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User priorities document keyed by user authentication UID"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Decide For Me",
+  "description": "A hyper-rational decision assistant for chronically indecisive people facing life choices.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

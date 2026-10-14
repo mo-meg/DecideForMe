@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+.speech-bubble {
+  position: relative;
+}
+
+.speech-bubble::before {
+  content: '';
+  position: absolute;
+  top: -6px;
+  left: 24px;
+  width: 12px;
+  height: 12px;
+  background-color: #ffffff;
+  border-left: 1px solid #e2e8f0;
+  border-top: 1px solid #e2e8f0;
+  transform: rotate(45deg);
+}
+
+::selection {
+  background-color: #e0ebfe;
+  color: #1e3a8a;
+}
