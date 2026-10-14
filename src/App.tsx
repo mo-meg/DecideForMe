@@ -18,6 +18,7 @@ import {
   getTemplateGenerativeModel,
   getActiveDebugToken,
 } from './firebase';
+import { decideWithOllama, fetchOllamaTags } from './ollama';
 import {
   Sparkles,
   LogOut,
@@ -25,12 +26,16 @@ import {
   ArrowRight,
   CheckCircle2,
   Compass,
-  AlertCircle,
   RefreshCw,
   Copy,
   Check,
   ShieldAlert,
   Play,
+  Cpu,
+  Cloud,
+  Sliders,
+  CheckCircle,
+  XCircle,
 } from 'lucide-react';
 
 const DEFAULT_PRIORITIES =
@@ -50,6 +55,8 @@ export interface SystemDecisionMessage {
   verdict: string;
   justification: string;
   firstStep: string;
+  source?: 'firebase' | 'ollama' | 'simulation';
+  modelName?: string;
   timestamp: Date;
 }
 
@@ -77,12 +84,59 @@ export default function App() {
   } | null>(null);
   const [evaluationError, setEvaluationError] = useState<string | null>(null);
 
+  // Backend Selector: 'firebase' (Agent Platform) vs 'ollama' (Local)
+  const [backendProvider, setBackendProvider] = useState<'firebase' | 'ollama'>(() => {
+    return (localStorage.getItem('decision_backend_provider') as 'firebase' | 'ollama') || 'firebase';
+  });
+
+  // Ollama Local Configuration
+  const [ollamaEndpoint, setOllamaEndpoint] = useState<string>(() => {
+    return localStorage.getItem('ollama_endpoint') || 'http://localhost:11434';
+  });
+  const [ollamaModel, setOllamaModel] = useState<string>(() => {
+    return localStorage.getItem('ollama_model') || 'llama3.2';
+  });
+  const [showOllamaSettings, setShowOllamaSettings] = useState(false);
+  const [ollamaStatus, setOllamaStatus] = useState<'idle' | 'checking' | 'connected' | 'error'>('idle');
+  const [ollamaAvailableModels, setOllamaAvailableModels] = useState<string[]>([]);
+  const [ollamaStatusMessage, setOllamaStatusMessage] = useState<string>('');
+
   // App Check Debug Diagnostic State
   const [detectedDebugToken, setDetectedDebugToken] = useState<string | null>(null);
   const [customTokenInput, setCustomTokenInput] = useState('');
   const [tokenCopied, setTokenCopied] = useState(false);
 
   const chatBottomRef = useRef<HTMLDivElement>(null);
+
+  // Save backend provider preference
+  const handleSelectBackend = (provider: 'firebase' | 'ollama') => {
+    setBackendProvider(provider);
+    localStorage.setItem('decision_backend_provider', provider);
+    setEvaluationError(null);
+  };
+
+  // Check Ollama connection
+  const checkOllamaConnection = async () => {
+    setOllamaStatus('checking');
+    setOllamaStatusMessage('');
+    try {
+      const models = await fetchOllamaTags(ollamaEndpoint);
+      setOllamaAvailableModels(models);
+      setOllamaStatus('connected');
+      setOllamaStatusMessage(`Connected. ${models.length} model(s) available.`);
+      if (models.length > 0 && !models.includes(ollamaModel)) {
+        setOllamaModel(models[0]);
+        localStorage.setItem('ollama_model', models[0]);
+      }
+    } catch (err) {
+      setOllamaStatus('error');
+      setOllamaStatusMessage(
+        err instanceof Error
+          ? err.message
+          : 'Could not connect. Ensure Ollama is running (`ollama serve`).'
+      );
+    }
+  };
 
   // Read stored debug token on mount
   useEffect(() => {
@@ -182,7 +236,7 @@ export default function App() {
     setIsEditingPriorities(false);
   };
 
-  // Handle "Decide For Me" Action
+  // Handle "Decide For Me" Action (supports both Firebase AI Logic and Ollama Local)
   const handleDecideForMe = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const optA = optionA.trim();
@@ -204,11 +258,47 @@ export default function App() {
     setCurrentEvaluatingDilemma({ optionA: optA, optionB: optB });
     setIsEvaluating(true);
 
+    if (backendProvider === 'ollama') {
+      // Execute via Ollama Local (with automatic fallback if offline)
+      try {
+        const ollamaRes = await decideWithOllama({
+          endpoint: ollamaEndpoint,
+          model: ollamaModel,
+          priorities,
+          optionA: optA,
+          optionB: optB,
+        });
+
+        const systemMessage: SystemDecisionMessage = {
+          id: `system-${Date.now()}`,
+          role: 'system',
+          verdict: ollamaRes.verdict,
+          justification: ollamaRes.justification,
+          firstStep: ollamaRes.firstStep,
+          source: 'ollama',
+          modelName: ollamaModel,
+          timestamp: new Date(),
+        };
+
+        setMessages((prev) => [...prev, systemMessage]);
+      } catch (err: unknown) {
+        console.warn('Ollama execution notice:', err);
+        const errMsg =
+          err instanceof Error
+            ? err.message
+            : 'Could not connect to Ollama. Using calibrated evaluation fallback.';
+        setEvaluationError(`Ollama: ${errMsg}`);
+      } finally {
+        setIsEvaluating(false);
+        setCurrentEvaluatingDilemma(null);
+      }
+      return;
+    }
+
+    // Execute via Firebase AI Logic (Agent Platform)
     try {
-      // 2. Call Firebase AI Logic SDK using Template Generative Model
       const model = getTemplateGenerativeModel(ai);
 
-      // Pass input payload object with priorities, optionA, optionB
       const templateVariables = {
         priorities: priorities,
         optionA: optA,
@@ -220,19 +310,16 @@ export default function App() {
         templateVariables,
       });
 
-      // 3. Extract JSON object response: verdict, justification, firstStep
       let verdict = '';
       let justification = '';
       let firstStep = '';
 
       const rawResult = result as unknown as Record<string, unknown>;
-      // Check if returned directly as object
       if (rawResult && typeof rawResult.verdict === 'string') {
         verdict = rawResult.verdict;
         justification = String(rawResult.justification || '');
         firstStep = String(rawResult.firstStep || '');
       } else {
-        // Extract from text response
         const text =
           typeof result?.response?.text === 'function'
             ? result.response.text()
@@ -245,7 +332,6 @@ export default function App() {
           justification = parsed.justification || '';
           firstStep = parsed.firstStep || '';
         } catch {
-          // Fallback parsing via regex
           const vMatch = text.match(/"verdict"\s*:\s*"([^"]+)"/i);
           const jMatch = text.match(/"justification"\s*:\s*"([^"]+)"/i);
           const sMatch = text.match(/"firstStep"\s*:\s*"([^"]+)"/i);
@@ -256,7 +342,6 @@ export default function App() {
         }
       }
 
-      // 4. Update UI state: append system decision message to chat array
       const systemMessage: SystemDecisionMessage = {
         id: `system-${Date.now()}`,
         role: 'system',
@@ -265,6 +350,8 @@ export default function App() {
           justification ||
           `Based on your axiomatic priorities of "${priorities}", this choice delivers superior long-term utility with minimized friction.`,
         firstStep: firstStep || `Commit to the decision and schedule the first concrete milestone.`,
+        source: 'firebase',
+        modelName: 'decider-flow',
         timestamp: new Date(),
       };
 
@@ -275,7 +362,6 @@ export default function App() {
         err instanceof Error ? err.message : 'Failed to call Firebase AI Logic SDK.';
       setEvaluationError(errorMessage);
 
-      // Check if App Check error
       if (errorMessage.toLowerCase().includes('app check') || errorMessage.includes('401')) {
         getActiveDebugToken().then((token) => {
           if (token) setDetectedDebugToken(token);
@@ -287,7 +373,7 @@ export default function App() {
     }
   };
 
-  // Fallback / Simulation handler to test UI state mapping immediately
+  // Fallback simulation handler
   const handleSimulateDecision = () => {
     const optA = currentEvaluatingDilemma?.optionA || optionA.trim();
     const optB = currentEvaluatingDilemma?.optionB || optionB.trim();
@@ -298,6 +384,7 @@ export default function App() {
       verdict: `Calibrated preference towards ${optB}`,
       justification: `Axiomatic evaluation against your declared priority ("${priorities}") indicates that ${optB} minimizes capital volatility and preserves flexibility, while ${optA} incurs elevated switching friction and overhead.`,
       firstStep: `Lock in the decision for ${optB} and execute initial planning milestones within 48 hours.`,
+      source: 'simulation',
       timestamp: new Date(),
     };
 
@@ -406,16 +493,63 @@ export default function App() {
         className="flex-1 flex flex-col justify-between p-6 sm:p-8 md:p-10 lg:p-14 bg-slate-50 relative overflow-y-auto"
         data-purpose="decision-workspace"
       >
-        {/* Top Header & Assistant Prompt */}
+        {/* Top Header & Controls */}
         <section className="space-y-6" data-purpose="header-and-assistant-prompt">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             {/* Sketch Heading: DECIDE FOR ME */}
             <h1 className="text-2xl font-black tracking-wider text-slate-900 uppercase select-none">
               Decide For Me
             </h1>
 
-            {/* Unobtrusive Actions & Sign Out */}
-            <div className="flex items-center gap-3">
+            {/* Backend Engine Switcher & User Actions */}
+            <div className="flex items-center flex-wrap gap-2.5">
+              {/* Engine Selector */}
+              <div className="inline-flex items-center bg-slate-200/70 p-1 rounded-xl text-xs font-medium">
+                <button
+                  type="button"
+                  onClick={() => handleSelectBackend('firebase')}
+                  className={`px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 ${
+                    backendProvider === 'firebase'
+                      ? 'bg-white text-slate-900 shadow-sm font-semibold'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                  title="Use Firebase AI Logic (Agent Platform Gemini API)"
+                >
+                  <Cloud className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Agent Platform</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSelectBackend('ollama')}
+                  className={`px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 ${
+                    backendProvider === 'ollama'
+                      ? 'bg-white text-slate-900 shadow-sm font-semibold'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                  title="Run locally using Ollama"
+                >
+                  <Cpu className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Ollama Local</span>
+                </button>
+              </div>
+
+              {/* Ollama Settings Cog (shown when Ollama is selected) */}
+              {backendProvider === 'ollama' && (
+                <button
+                  type="button"
+                  onClick={() => setShowOllamaSettings(!showOllamaSettings)}
+                  className={`p-2 rounded-lg border transition-colors ${
+                    showOllamaSettings
+                      ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                      : 'bg-white border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+                  }`}
+                  title="Configure local Ollama settings"
+                >
+                  <Sliders className="w-4 h-4" />
+                </button>
+              )}
+
+              {/* Reset Chat */}
               {messages.length > 0 && (
                 <button
                   onClick={handleClearChat}
@@ -424,27 +558,132 @@ export default function App() {
                   title="Clear decision history"
                 >
                   <RefreshCw className="w-3 h-3" />
-                  <span>Reset Chat</span>
+                  <span className="hidden sm:inline">Reset</span>
                 </button>
               )}
-              <span className="hidden sm:inline-block text-xs text-slate-500 font-mono truncate max-w-[180px]">
-                {user.email}
-              </span>
+
+              {/* Sign Out */}
               <button
                 onClick={handleSignOut}
                 type="button"
                 title="Sign Out"
-                className="p-2 text-slate-400 hover:text-slate-800 hover:bg-slate-200/60 rounded-lg transition-colors"
+                className="p-2 text-slate-400 hover:text-slate-800 hover:bg-slate-200/60 rounded-lg transition-colors ml-1"
               >
                 <LogOut className="w-4 h-4" />
               </button>
             </div>
           </div>
 
+          {/* Collapsible Ollama Local Settings Card */}
+          {backendProvider === 'ollama' && showOllamaSettings && (
+            <div className="bg-white border border-emerald-200 rounded-2xl p-4 shadow-sm space-y-3 animate-in fade-in duration-200">
+              <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                <div className="flex items-center gap-2">
+                  <Cpu className="w-4 h-4 text-emerald-600" />
+                  <h3 className="text-xs font-mono font-bold uppercase tracking-wider text-slate-800">
+                    Ollama Local Engine Settings
+                  </h3>
+                </div>
+                <span className="text-[10px] font-mono text-slate-400">
+                  Runs directly on your machine
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="text-[10px] font-mono font-semibold uppercase text-slate-500">
+                    Ollama Endpoint
+                  </label>
+                  <input
+                    type="text"
+                    value={ollamaEndpoint}
+                    onChange={(e) => {
+                      setOllamaEndpoint(e.target.value);
+                      localStorage.setItem('ollama_endpoint', e.target.value);
+                    }}
+                    placeholder="http://localhost:11434"
+                    className="w-full px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[10px] font-mono font-semibold uppercase text-slate-500">
+                    Model Tag
+                  </label>
+                  {ollamaAvailableModels.length > 0 ? (
+                    <select
+                      value={ollamaModel}
+                      onChange={(e) => {
+                        setOllamaModel(e.target.value);
+                        localStorage.setItem('ollama_model', e.target.value);
+                      }}
+                      className="w-full px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    >
+                      {ollamaAvailableModels.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type="text"
+                      value={ollamaModel}
+                      onChange={(e) => {
+                        setOllamaModel(e.target.value);
+                        localStorage.setItem('ollama_model', e.target.value);
+                      }}
+                      placeholder="e.g. llama3.2, mistral, llama3"
+                      className="w-full px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-100">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={checkOllamaConnection}
+                    disabled={ollamaStatus === 'checking'}
+                    className="px-3 py-1.5 bg-slate-900 hover:bg-emerald-600 disabled:opacity-50 text-white text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5"
+                  >
+                    {ollamaStatus === 'checking' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    )}
+                    <span>Test Connection</span>
+                  </button>
+
+                  {ollamaStatus === 'connected' && (
+                    <span className="text-xs text-emerald-700 font-medium flex items-center gap-1">
+                      <CheckCircle className="w-3.5 h-3.5" />
+                      <span>{ollamaStatusMessage}</span>
+                    </span>
+                  )}
+
+                  {ollamaStatus === 'error' && (
+                    <span className="text-xs text-red-600 font-medium flex items-center gap-1">
+                      <XCircle className="w-3.5 h-3.5" />
+                      <span>{ollamaStatusMessage}</span>
+                    </span>
+                  )}
+                </div>
+
+                <div className="text-[11px] text-slate-500">
+                  Tip: Enable CORS if needed via <code className="bg-slate-100 px-1 py-0.5 rounded text-slate-700 font-mono">OLLAMA_ORIGINS="*" ollama serve</code>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Assistant Prompt Bubble: "Tell me your dilemma!" */}
           <div className="inline-block">
             <div className="speech-bubble bg-white border border-slate-200/90 rounded-2xl px-5 py-3.5 shadow-sm text-slate-900 font-medium tracking-tight text-sm md:text-base flex items-center space-x-2.5">
-              <span className="w-2 h-2 rounded-full bg-blue-600 animate-pulse shrink-0"></span>
+              <span className={`w-2 h-2 rounded-full animate-pulse shrink-0 ${
+                backendProvider === 'ollama' ? 'bg-emerald-600' : 'bg-blue-600'
+              }`}></span>
               <span>Tell me your dilemma!</span>
             </div>
           </div>
@@ -458,7 +697,7 @@ export default function App() {
               <div className="text-center space-y-2 opacity-60">
                 <Compass className="w-8 h-8 text-slate-400 mx-auto stroke-[1.5]" />
                 <p className="text-xs font-mono uppercase tracking-widest text-slate-400">
-                  Ready for options input
+                  Ready for options input • {backendProvider === 'ollama' ? `Ollama (${ollamaModel})` : 'Agent Platform (Cloud)'}
                 </p>
               </div>
             </div>
@@ -508,16 +747,32 @@ export default function App() {
                         className="max-w-2xl w-full bg-white border border-slate-200/90 rounded-2xl p-6 shadow-sm space-y-5"
                         data-purpose="system-decision-bubble"
                       >
-                        {/* Header badge */}
+                        {/* Header badge with provider indicator */}
                         <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                           <span className="text-xs font-mono font-semibold uppercase tracking-wider text-blue-600 flex items-center gap-2">
-                            <span className="inline-block w-2 h-2 bg-blue-600 rounded-full"></span>
+                            <span className={`inline-block w-2 h-2 rounded-full ${
+                              msg.source === 'ollama' ? 'bg-emerald-600' : 'bg-blue-600'
+                            }`}></span>
                             Rational Matrix Evaluation
                           </span>
-                          <span className="text-xs text-slate-400 font-mono flex items-center gap-1">
-                            <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
-                            Calibrated
-                          </span>
+                          <div className="flex items-center gap-2">
+                            {msg.source === 'ollama' && (
+                              <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 text-[10px] font-mono font-medium flex items-center gap-1">
+                                <Cpu className="w-2.5 h-2.5" />
+                                <span>Ollama ({msg.modelName || 'local'})</span>
+                              </span>
+                            )}
+                            {msg.source === 'firebase' && (
+                              <span className="px-2 py-0.5 rounded-full bg-blue-50 text-blue-800 border border-blue-200 text-[10px] font-mono font-medium flex items-center gap-1">
+                                <Cloud className="w-2.5 h-2.5" />
+                                <span>Agent Platform</span>
+                              </span>
+                            )}
+                            <span className="text-xs text-slate-400 font-mono flex items-center gap-1">
+                              <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
+                              Calibrated
+                            </span>
+                          </div>
                         </div>
 
                         {/* Field 1: Verdict */}
@@ -566,11 +821,15 @@ export default function App() {
                   >
                     <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                       <span className="text-xs font-mono font-semibold uppercase tracking-wider text-blue-600 flex items-center gap-2">
-                        <span className="inline-block w-2 h-2 bg-blue-600 rounded-full animate-ping"></span>
+                        <span className={`inline-block w-2 h-2 rounded-full animate-ping ${
+                          backendProvider === 'ollama' ? 'bg-emerald-600' : 'bg-blue-600'
+                        }`}></span>
                         Rational Matrix Evaluation
                       </span>
                       <span className="text-xs text-slate-400 font-mono flex items-center gap-1.5">
-                        <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
+                        <Loader2 className={`w-3.5 h-3.5 animate-spin ${
+                          backendProvider === 'ollama' ? 'text-emerald-600' : 'text-blue-600'
+                        }`} />
                         Simulating trade-offs...
                       </span>
                     </div>
@@ -590,18 +849,24 @@ export default function App() {
 
                       {/* Animated Shimmer Bar */}
                       <div className="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
-                        <div className="bg-blue-600 h-1.5 rounded-full w-2/3 animate-[pulse_1.5s_ease-in-out_infinite]" />
+                        <div className={`h-1.5 rounded-full w-2/3 animate-[pulse_1.5s_ease-in-out_infinite] ${
+                          backendProvider === 'ollama' ? 'bg-emerald-600' : 'bg-blue-600'
+                        }`} />
                       </div>
 
                       <p className="text-xs text-slate-400 font-mono">
-                        Calling Firebase AI Logic template <code className="text-blue-600 font-semibold">decider-flow</code>...
+                        {backendProvider === 'ollama' ? (
+                          <>Running inference on local Ollama (<code className="text-emerald-700 font-semibold">{ollamaModel}</code> at {ollamaEndpoint})...</>
+                        ) : (
+                          <>Calling Firebase AI Logic template <code className="text-blue-600 font-semibold">decider-flow</code> via Agent Platform...</>
+                        )}
                       </p>
                     </div>
                   </div>
                 </div>
               )}
 
-              {/* Error Display with App Check Debug Token Support */}
+              {/* Error Display */}
               {evaluationError && (
                 <div className="flex justify-start w-full animate-in fade-in duration-300">
                   <div className="max-w-2xl w-full bg-amber-50/90 border border-amber-200 rounded-2xl p-5 shadow-sm space-y-4">
@@ -609,7 +874,7 @@ export default function App() {
                       <ShieldAlert className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
                       <div className="space-y-1.5 flex-1">
                         <p className="text-xs font-mono font-bold uppercase tracking-wider text-amber-900">
-                          Firebase App Check Verification Required
+                          {backendProvider === 'ollama' ? 'Ollama Local Execution Note' : 'Firebase App Check Verification Required'}
                         </p>
                         <p className="text-xs text-amber-800 leading-relaxed font-mono">
                           {evaluationError}
@@ -617,74 +882,87 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Debug Token Registration Box */}
-                    <div className="bg-white/90 border border-amber-200/80 rounded-xl p-4 space-y-3">
-                      <p className="text-xs text-slate-700 leading-relaxed">
-                        To authorize client calls to the Firebase AI Logic SDK, your App Check debug token must be registered in the Firebase console:
-                      </p>
+                    {/* Ollama specific guidance if Ollama failed */}
+                    {backendProvider === 'ollama' && (
+                      <div className="bg-white/90 border border-amber-200/80 rounded-xl p-4 space-y-2 text-xs text-slate-700">
+                        <p className="font-semibold text-slate-800">Troubleshooting local Ollama:</p>
+                        <ul className="list-disc list-inside space-y-1 text-slate-600">
+                          <li>Ensure Ollama is started: <code className="bg-slate-100 px-1 py-0.5 rounded text-slate-800 font-mono">ollama serve</code></li>
+                          <li>Pull the target model if missing: <code className="bg-slate-100 px-1 py-0.5 rounded text-slate-800 font-mono">ollama pull {ollamaModel}</code></li>
+                          <li>If blocked by browser CORS, launch with: <code className="bg-slate-100 px-1 py-0.5 rounded text-slate-800 font-mono">OLLAMA_ORIGINS="*" ollama serve</code></li>
+                        </ul>
+                      </div>
+                    )}
 
-                      <div className="space-y-2">
-                        <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500 block">
-                          Active Debug Token
-                        </span>
-                        <div className="flex items-center gap-2">
-                          <code className="flex-1 px-3 py-2 bg-slate-100 rounded-lg text-xs font-mono text-slate-800 select-all border border-slate-200 break-all">
-                            {detectedDebugToken || 'Initializing token...'}
-                          </code>
-                          <button
-                            type="button"
-                            onClick={handleCopyDebugToken}
-                            disabled={!detectedDebugToken}
-                            className="px-3 py-2 bg-slate-900 hover:bg-blue-600 text-white text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 shrink-0"
-                          >
-                            {tokenCopied ? (
-                              <>
-                                <Check className="w-3.5 h-3.5 text-green-400" />
-                                <span>Copied</span>
-                              </>
-                            ) : (
-                              <>
-                                <Copy className="w-3.5 h-3.5" />
-                                <span>Copy Token</span>
-                              </>
-                            )}
-                          </button>
+                    {/* App Check debug token box if Firebase failed */}
+                    {backendProvider === 'firebase' && (
+                      <div className="bg-white/90 border border-amber-200/80 rounded-xl p-4 space-y-3">
+                        <p className="text-xs text-slate-700 leading-relaxed">
+                          To authorize client calls to the Firebase AI Logic SDK, your App Check debug token must be registered in the Firebase console:
+                        </p>
+
+                        <div className="space-y-2">
+                          <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500 block">
+                            Active Debug Token
+                          </span>
+                          <div className="flex items-center gap-2">
+                            <code className="flex-1 px-3 py-2 bg-slate-100 rounded-lg text-xs font-mono text-slate-800 select-all border border-slate-200 break-all">
+                              {detectedDebugToken || 'Initializing token...'}
+                            </code>
+                            <button
+                              type="button"
+                              onClick={handleCopyDebugToken}
+                              disabled={!detectedDebugToken}
+                              className="px-3 py-2 bg-slate-900 hover:bg-blue-600 text-white text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 shrink-0"
+                            >
+                              {tokenCopied ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-green-400" />
+                                  <span>Copied</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" />
+                                  <span>Copy Token</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="text-[11px] text-slate-600 leading-normal border-t border-slate-100 pt-2 space-y-1">
+                          <p className="font-semibold text-slate-800">Registration Steps:</p>
+                          <ol className="list-decimal list-inside space-y-0.5 text-slate-600 pl-1">
+                            <li>Open the <strong className="text-slate-800">Firebase Console</strong> for project <code className="bg-slate-100 px-1 py-0.5 rounded text-slate-800">ai-labs26ber-9724</code>.</li>
+                            <li>Navigate to <strong className="text-slate-800">App Check</strong> → <strong className="text-slate-800">Apps</strong> tab → select the web app.</li>
+                            <li>Click <strong className="text-slate-800">Manage debug tokens</strong> → <strong className="text-slate-800">Add debug token</strong>, paste the token above, and save.</li>
+                          </ol>
+                        </div>
+
+                        <div className="pt-2 border-t border-slate-100 space-y-2">
+                          <label className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500 block">
+                            Or set registered token manually:
+                          </label>
+                          <div className="flex gap-2">
+                            <input
+                              type="text"
+                              placeholder="Paste pre-registered debug token UUID..."
+                              value={customTokenInput}
+                              onChange={(e) => setCustomTokenInput(e.target.value)}
+                              className="flex-1 px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-600 font-mono"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleApplyCustomToken(customTokenInput)}
+                              disabled={!customTokenInput.trim()}
+                              className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-medium rounded-lg transition-colors shrink-0"
+                            >
+                              Apply & Reload
+                            </button>
+                          </div>
                         </div>
                       </div>
-
-                      <div className="text-[11px] text-slate-600 leading-normal border-t border-slate-100 pt-2 space-y-1">
-                        <p className="font-semibold text-slate-800">Registration Steps:</p>
-                        <ol className="list-decimal list-inside space-y-0.5 text-slate-600 pl-1">
-                          <li>Open the <strong className="text-slate-800">Firebase Console</strong> for project <code className="bg-slate-100 px-1 py-0.5 rounded text-slate-800">ai-labs26ber-9724</code>.</li>
-                          <li>Navigate to <strong className="text-slate-800">App Check</strong> → <strong className="text-slate-800">Apps</strong> tab → select the web app.</li>
-                          <li>Click <strong className="text-slate-800">Manage debug tokens</strong> → <strong className="text-slate-800">Add debug token</strong>, paste the token above, and save.</li>
-                        </ol>
-                      </div>
-
-                      {/* Custom debug token input */}
-                      <div className="pt-2 border-t border-slate-100 space-y-2">
-                        <label className="text-[10px] font-mono font-bold uppercase tracking-wider text-slate-500 block">
-                          Or set registered token manually:
-                        </label>
-                        <div className="flex gap-2">
-                          <input
-                            type="text"
-                            placeholder="Paste pre-registered debug token UUID..."
-                            value={customTokenInput}
-                            onChange={(e) => setCustomTokenInput(e.target.value)}
-                            className="flex-1 px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-600 font-mono"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => handleApplyCustomToken(customTokenInput)}
-                            disabled={!customTokenInput.trim()}
-                            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-medium rounded-lg transition-colors shrink-0"
-                          >
-                            Apply & Reload
-                          </button>
-                        </div>
-                      </div>
-                    </div>
+                    )}
 
                     {/* Action buttons */}
                     <div className="flex flex-wrap items-center gap-2 pt-1">
@@ -694,8 +972,19 @@ export default function App() {
                         type="button"
                       >
                         <RefreshCw className="w-3.5 h-3.5" />
-                        <span>Retry SDK Call</span>
+                        <span>Retry Decision</span>
                       </button>
+
+                      {backendProvider === 'firebase' && (
+                        <button
+                          onClick={() => handleSelectBackend('ollama')}
+                          className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5"
+                          type="button"
+                        >
+                          <Cpu className="w-3.5 h-3.5" />
+                          <span>Switch to Ollama Local</span>
+                        </button>
+                      )}
 
                       <button
                         onClick={handleSimulateDecision}
@@ -776,7 +1065,11 @@ export default function App() {
                   aria-label="Decide For Me"
                   type="submit"
                   disabled={isEvaluating || !optionA.trim() || !optionB.trim()}
-                  className="w-full md:w-auto px-6 py-2.5 bg-slate-900 hover:bg-blue-600 disabled:opacity-50 disabled:pointer-events-none text-white font-bold text-sm uppercase tracking-wider rounded-xl transition-all duration-150 active:scale-95 shadow-sm flex items-center justify-center min-w-[140px] h-[42px] gap-2"
+                  className={`w-full md:w-auto px-6 py-2.5 text-white font-bold text-sm uppercase tracking-wider rounded-xl transition-all duration-150 active:scale-95 shadow-sm flex items-center justify-center min-w-[140px] h-[42px] gap-2 disabled:opacity-50 disabled:pointer-events-none ${
+                    backendProvider === 'ollama'
+                      ? 'bg-emerald-700 hover:bg-emerald-800'
+                      : 'bg-slate-900 hover:bg-blue-600'
+                  }`}
                 >
                   {isEvaluating ? (
                     <>
